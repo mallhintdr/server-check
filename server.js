@@ -26,7 +26,22 @@ const GEO_ROOT    = path.join(PUBLIC_ROOT, 'JSON Murabba');
 const TILE_ROOT   = path.join(PUBLIC_ROOT, 'Shajra Parcha');
 
 // Middleware Configuration
-app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+//app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
+const allowed = [
+  'https://dashboard.naqsha-zameen.pk',
+  'http://localhost:3000'        // remove if not needed
+];
+
+app.use(
+  cors({
+    origin: (origin, cb) => {
+      if (!origin || allowed.includes(origin)) cb(null, true);
+      else cb(new Error('Not allowed by CORS'));
+    },
+    credentials: true,
+  })
+);
+
 app.use(express.json());
 app.use(cookieParser());
 
