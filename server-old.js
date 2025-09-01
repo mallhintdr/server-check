@@ -10,9 +10,6 @@ const fs = require('fs');
 const path = require('path');
 
 const app = express();
-const crypto = require('crypto');
-
-const nodemailer = require('nodemailer');
 
 const PORT = process.env.PORT;
 const SECRET_KEY = process.env.SECRET_KEY;
@@ -29,7 +26,7 @@ app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
 app.use(express.json());
 app.use(cookieParser());
 
-// app.use('/JSON Murabba',  express.static(GEO_ROOT));
+app.use('/JSON Murabba',  express.static(GEO_ROOT));
 app.use('/Shajra Parcha', express.static(TILE_ROOT));
 
 // MongoDB Connection
@@ -65,25 +62,12 @@ const userSchema = new mongoose.Schema({
   daysRemaining: Number,
   status: String,
   userType: { type: String, enum: ['user', 'admin'], default: 'user' },
-email: { type: String, unique: true, sparse: true }
-, // recommended for identification
-resetPasswordToken: { type: String },
-resetPasswordExpires: { type: Date },
+
   fee: { type: Number, default: 1000 },
   renewalHistory: { type: [renewalEntrySchema], default: [] },
   renewalCount: { type: Number, default: 0 },
   sessions: [sessionSchema]
 });
-
-// --- GeoJSON Schema & Model ---
-const geoJsonSchema = new mongoose.Schema({
-  tehsil: { type: String, required: true, index: true },
-  mauza:  { type: String, required: true, index: true },
-  data:   { type: mongoose.Schema.Types.Mixed, required: true },
-  defaultBounds: { type: [[Number]], default: null } // [[swLat, swLng], [neLat, neLng]]
-});
-const GeoJson = mongoose.model('GeoJson', geoJsonSchema);
-
 
 // Helper: Calculate End Date, Days Remaining, and Status
 const calculateDatesAndStatus = (startDate, subscriptionType) => {
@@ -111,52 +95,6 @@ const calculateDatesAndStatus = (startDate, subscriptionType) => {
   return { endDate, daysRemaining, status };
 };
 
-
-const FEET_TO_METERS = 0.3048;
-
-function shiftCoordinates(coords, dx, dy) {
-  if (typeof coords[0] === 'number') {
-    const lat = coords[1];
-    // Equirectangular approximation
-    const dLat = dy / 111320;
-    const dLon = dx / (111320 * Math.cos(lat * Math.PI / 180));
-    return [coords[0] + dLon, coords[1] + dLat];
-  }
-  return coords.map(c => shiftCoordinates(c, dx, dy));
-}
-
-function getGeoJsonBounds(features) {
-  // Returns [[minLat, minLng], [maxLat, maxLng]]
-  const coords = [];
-  features.forEach(f => {
-    let arr = [];
-    if (f.geometry?.type === "Polygon") arr = f.geometry.coordinates.flat();
-    if (f.geometry?.type === "MultiPolygon") arr = f.geometry.coordinates.flat(2);
-    coords.push(...arr);
-  });
-  if (!coords.length) return null;
-  const lats = coords.map(c => c[1]);
-  const lngs = coords.map(c => c[0]);
-  return [
-    [Math.min(...lats), Math.min(...lngs)],
-    [Math.max(...lats), Math.max(...lngs)]
-  ];
-}
-
-// Find shift required to move current bounds to default bounds
-function computeShift(current, target) {
-  // Move SW corner
-  const [curLat, curLng] = current[0];
-  const [tgtLat, tgtLng] = target[0];
-  // Approximate meters delta
-  const dLat = tgtLat - curLat;
-  const dLng = tgtLng - curLng;
-  // Convert degrees to meters
-  const metersY = dLat * 111320;
-  const metersX = dLng * 111320 * Math.cos(curLat * Math.PI / 180);
-  return { dx: metersX, dy: metersY };
-}
-
 // Middleware: Hash Password and Calculate Status before Save
 userSchema.pre('save', async function (next) {
   try {
@@ -179,24 +117,9 @@ userSchema.pre('save', async function (next) {
 
 const User = mongoose.model('User', userSchema);
 
-
-
-app.get('/api/public/check-userid/:userId', async (req, res) => {
-  const { userId } = req.params;
-  try {
-    const user = await User.findOne({ userId });
-    if (user) return res.json({ exists: true });
-    else return res.json({ exists: false });
-  } catch (err) {
-    return res.status(500).json({ exists: false });
-  }
-});
-
-
 // --- Auth Middleware ---
 
 // 1) Verify token, subscription, and attach full user to req
-
 const isAuthenticated = async (req, res, next) => {
   const token = req.cookies.authToken;
   if (!token) return res.status(401).json({ message: 'Not authenticated' });
@@ -242,30 +165,6 @@ const isSelfOrAdmin = (req, res, next) => {
 };
 
 // --- Routes ---
-
-// dynamic GeoJSON from MongoDB
-app.get('/api/geojson/:tehsil/:mauza', async (req, res) => {
-  const { tehsil, mauza } = req.params;
-  const reqTime = new Date().toISOString();
-  console.log(`[${reqTime}] GeoJSON fetch requested: tehsil="${tehsil}", mauza="${mauza}"`);
-  try {
-    const doc = await GeoJson.findOne({ tehsil, mauza });
-    if (!doc) {
-      console.log(`[${reqTime}] GeoJSON NOT FOUND for: tehsil="${tehsil}", mauza="${mauza}"`);
-      return res.status(404).json({ message: 'GeoJSON not found' });
-    }
-    // Log stats about the data, e.g. feature count if FeatureCollection
-    let featuresCount = 0;
-    if (doc.data && doc.data.features && Array.isArray(doc.data.features)) {
-      featuresCount = doc.data.features.length;
-    }
-    console.log(`[${reqTime}] GeoJSON FOUND for: tehsil="${tehsil}", mauza="${mauza}". Features: ${featuresCount}`);
-    res.json(doc.data);
-  } catch (err) {
-    console.error(`[${reqTime}] Error fetching GeoJSON for tehsil="${tehsil}", mauza="${mauza}":`, err);
-    res.status(500).json({ message: 'Server error' });
-  }
-});
 
 // Login
 
@@ -336,115 +235,6 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// 2. Forgot Password endpoint
-app.post('/forgot-password', async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ message: 'Email is required' });
-
-  try {
-    // Find user by email
-    const user = await User.findOne({ email });
-    if (!user) {
-      // Always send success message to prevent email enumeration
-      return res.json({ message: 'If this email is registered, a reset link has been sent.' });
-    }
-
-    // Generate a reset token (valid for 1 hour)
-    const resetToken = jwt.sign(
-      { userId: user.userId },
-      SECRET_KEY,
-      { expiresIn: '1h' }
-    );
-
-    // Construct reset link (adjust frontend URL as needed)
-const resetLink = `${process.env.CORS_ORIGIN}/reset-password?token=${resetToken}`;
-    // Send email (adjust sender, subject, and message as desired)
-    let transporter = nodemailer.createTransport({
-      // Use your SMTP settings (for your domain or Gmail)
-      host: 'smtp.stackmail.com', // or 'smtp.gmail.com'
-      port: 465, // 587 for TLS, 587 for SSL
-      secure: true,
-      auth: {
-        user: process.env.SMTP_USER, // your email, e.g., reset-password@naqsha-zameen.pk
-        pass: process.env.SMTP_PASS, // your email password or app password
-      },
-    });
-
-    await transporter.sendMail({
-      from: `"Naqsha Zameen" <${process.env.SMTP_USER}>`,
-      to: user.email,
-      subject: 'Reset your password',
-      html: `
-        <p>Dear ${user.userName},</p>
-        <p>To reset your password, please click the link below. This link is valid for 1 hour:</p>
-        <a href="${resetLink}">${resetLink}</a>
-        <p>If you did not request this, please ignore this email.</p>
-      `,
-    });
-
-    res.json({ message: 'If this email is registered, a reset link has been sent.' });
-  } catch (error) {
-    console.error('Forgot password error:', error);
-    res.status(500).json({ message: 'Failed to send reset email.' });
-  }
-});
-
-
-// POST /api/auth/request-reset
-app.post('/api/auth/request-reset', async (req, res) => {
-  const { email } = req.body;
-  if (!email) return res.status(400).json({ message: 'Email required.' });
-
-  const user = await User.findOne({ email });
-  if (!user) return res.status(400).json({ message: 'No user with this email.' });
-
-  // Generate token & set expiry
-  const token = crypto.randomBytes(32).toString('hex');
-  user.resetPasswordToken = token;
-  user.resetPasswordExpires = Date.now() + 1000 * 60 * 60; // 1 hour
-  await user.save();
-
-  // Construct reset link
-  const resetLink = `${process.env.FRONTEND_URL}/reset-password/${token}`;
-
-  // Email setup
-  const mailOptions = {
-    from: process.env.EMAIL_USER,
-    to: user.email,
-    subject: 'Reset your password',
-    html: `<p>Click the link below to reset your password (valid for 1 hour):<br>
-           <a href="${resetLink}">${resetLink}</a></p>`
-  };
-
-  try {
-    await transporter.sendMail(mailOptions);
-    res.json({ message: 'Password reset link sent. Please check your email.' });
-  } catch (err) {
-    console.error('Reset email error:', err);
-    res.status(500).json({ message: 'Failed to send email.' });
-  }
-});
-
-// POST /api/auth/reset-password
-app.post('/api/auth/reset-password', async (req, res) => {
-  const { token, password } = req.body;
-  if (!token || !password) return res.status(400).json({ message: 'Invalid request.' });
-
-  try {
-    // Verify JWT token
-    const decoded = jwt.verify(token, SECRET_KEY);
-    const user = await User.findOne({ userId: decoded.userId });
-    if (!user) return res.status(400).json({ message: 'Invalid token/user.' });
-
-    user.password = password; // Will be hashed by pre-save
-    await user.save();
-
-    res.json({ message: 'Password reset successful. You can now log in.' });
-  } catch (err) {
-    console.error('Reset password error:', err);
-    res.status(400).json({ message: 'Token invalid or expired.' });
-  }
-});
 
 
 // Logout
@@ -544,33 +334,6 @@ app.get('/profile', isAuthenticated, async (req, res) => {
 
 // --- Protected CRUD Routes ---
 
-app.get('/api/users/search', isAuthenticated, isAdmin, async (req, res) => {
-  const query = req.query.query?.toLowerCase() || '';
-  if (!query) return res.json([]);
-  try {
-    const users = await User.find({
-      $or: [
-        { userId:   { $regex: query, $options: 'i' } },
-        { userName: { $regex: query, $options: 'i' } }
-      ]
-    }).limit(15).select('userId userName -_id');
-    res.json(users);
-  } catch (err) {
-    console.error('User search error:', err);
-    res.status(500).json([]);
-  }
-});
-
-app.get('/api/tehsil-list', async (req, res) => {
-  try {
-    const tehsils = await GeoJson.distinct('tehsil');
-    res.json(tehsils.sort((a, b) => a.localeCompare(b)));
-  } catch (err) {
-    console.error('tehsil-list error:', err);
-    res.status(500).json([]);
-  }
-});
-
 // GET all users (admin only)
 app.get('/users', isAuthenticated, isAdmin, async (req, res) => {
   try {
@@ -598,10 +361,12 @@ app.get('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
 app.put('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
   try {
     const updateData = { ...req.body };
-    if (!updateData.password || !updateData.password.trim()) {
-  delete updateData.password;
-}
-
+    if (updateData.password && updateData.password.trim()) {
+      const salt = await bcrypt.genSalt(10);
+      updateData.password = await bcrypt.hash(updateData.password, salt);
+    } else {
+      delete updateData.password;
+    }
 
     // Fetch existing user to check for renewal
     const user = await User.findOne({ userId: req.params.userId });
@@ -737,56 +502,6 @@ app.get('/online-users', isAuthenticated /* or isAdmin */, async (_req, res) => 
     console.error('online-users error', err);
     res.status(500).json({ error: 'Unable to fetch online users' });
   }
-});
-// POST: Shift GeoJSON
-app.post('/api/geojson/:tehsil/:mauza/shift', isAuthenticated, async (req, res) => {
-  const { tehsil, mauza } = req.params;
-  const { distance, direction } = req.body; // { distance: Number (feet), direction: 'North'|'South'|'East'|'West' }
-  const meters = parseFloat(distance) * FEET_TO_METERS;
-
-  let dx = 0, dy = 0;
-  if (direction === 'East')  dx = meters;
-  if (direction === 'West')  dx = -meters;
-  if (direction === 'North') dy = meters;
-  if (direction === 'South') dy = -meters;
-
-  const doc = await GeoJson.findOne({ tehsil, mauza });
-  if (!doc) return res.status(404).json({ message: 'GeoJSON not found' });
-
-  // Set defaultBounds only if not already set
-  if (!doc.defaultBounds) {
-    const bounds = getGeoJsonBounds(doc.data.features);
-    if (!bounds) return res.status(400).json({ message: 'No geometry found' });
-    doc.defaultBounds = bounds;
-  }
-
-  // Shift
-  doc.data.features.forEach(f => {
-    f.geometry.coordinates = shiftCoordinates(f.geometry.coordinates, dx, dy);
-  });
-  await doc.save();
-  res.json({ success: true, data: doc.data });
-});
-
-// POST: Reset GeoJSON to Default Bounds
-app.post('/api/geojson/:tehsil/:mauza/reset', isAuthenticated, async (req, res) => {
-  const { tehsil, mauza } = req.params;
-  const doc = await GeoJson.findOne({ tehsil, mauza });
-  if (!doc || !doc.defaultBounds) return res.status(400).json({ message: 'No default bounds set' });
-
-  // Get current bounds
-  const currentBounds = getGeoJsonBounds(doc.data.features);
-  if (!currentBounds) return res.status(400).json({ message: 'No geometry found' });
-
-  // Compute shift needed to realign SW corners
-  const { dx, dy } = computeShift(currentBounds, doc.defaultBounds);
-
-  // Shift back
-  doc.data.features.forEach(f => {
-    f.geometry.coordinates = shiftCoordinates(f.geometry.coordinates, dx, dy);
-  });
-  await doc.save();
-  res.json({ success: true, data: doc.data });
 });
 
 // Start Server

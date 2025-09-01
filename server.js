@@ -1,5 +1,11 @@
 // server.js
-require('dotenv').config();
+const dotenv = require('dotenv');
+const env = dotenv.config();
+if (env.error) {
+  console.warn('.env file not found; relying on existing environment variables');
+} else {
+  console.log('Loaded environment variables from .env');
+}
 
 const express = require('express');
 const mongoose = require('mongoose');
@@ -14,66 +20,157 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 
-const PORT = process.env.PORT;
-const SECRET_KEY = process.env.SECRET_KEY;
-const CORS_ORIGIN = process.env.CORS_ORIGIN;
-const MONGO_URI = process.env.MONGO_URI;
+// -------------------- ENV --------------------
+const PORT        = process.env.PORT || 5000;
+const SECRET_KEY  = process.env.SECRET_KEY;
+const MONGO_URI   = process.env.MONGO_URI;
+const CORS_RAW    = process.env.CORS_ORIGIN || '';
+const SMTP_USER   = process.env.SMTP_USER || '';  // e.g. reset-password@naqsha-zameen.pk
+const SMTP_PASS   = process.env.SMTP_PASS || '';
+const FRONTEND_URL = process.env.FRONTEND_URL || (CORS_RAW.split(',')[0] || '').trim();
 
-// Paths for serving static files
+// -------------------- STATIC PATHS --------------------
 const ROOT        = path.join(__dirname, '..');        // geo-dashboard/
 const PUBLIC_ROOT = path.join(ROOT, 'public');         // geo-dashboard/public
 const GEO_ROOT    = path.join(PUBLIC_ROOT, 'JSON Murabba');
 const TILE_ROOT   = path.join(PUBLIC_ROOT, 'Shajra Parcha');
 
-// Middleware Configuration
-//app.use(cors({ origin: CORS_ORIGIN, credentials: true }));
-const allowed = [
-  'https://dashboard.naqsha-zameen.pk',
-  'http://localhost:3000'        // remove if not needed
-];
+// -------------------- MAIL TRANSPORTER (ONE INSTANCE) --------------------
+const transporter = (SMTP_USER && SMTP_PASS)
+  ? nodemailer.createTransport({
+      host: 'smtp.stackmail.com',
+      port: 465,
+      secure: true,
+      auth: { user: SMTP_USER, pass: SMTP_PASS },
+    })
+  : null;
 
-app.use(
-  cors({
-    origin: (origin, cb) => {
-      if (!origin || allowed.includes(origin)) cb(null, true);
-      else cb(new Error('Not allowed by CORS'));
-    },
+// -------------------- CORS (ALLOW-LIST WITH NORMALIZATION & WILDCARD) --------------------
+const rawOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean);
+
+// Normalize: lowercase, strip trailing slashes
+const normalizeOrigin = (o) => {
+  if (!o) return '';
+  try {
+    // If pattern like https://*.domain.tld keep as-is for matcher
+    if (o.includes('*')) return o.toLowerCase().replace(/\/+$/, '');
+    const u = new URL(o);
+    return `${u.protocol}//${u.host}`.toLowerCase().replace(/\/+$/, '');
+  } catch {
+    // Not a full URL (rare). Fallback:
+    return o.toLowerCase().replace(/\/+$/, '');
+  }
+};
+
+const allowedOrigins = rawOrigins.map(normalizeOrigin);
+
+// test function supports exact matches and wildcard subdomains (e.g., https://*.naqsha-zameen.pk)
+function isAllowedOrigin(requestOrigin) {
+  if (!requestOrigin) return true; // allow non-browser/SSR/no-origin requests
+  const origin = normalizeOrigin(requestOrigin);
+
+  for (const pat of allowedOrigins) {
+    if (!pat) continue;
+    if (!pat.includes('*')) {
+      // exact match
+      if (origin === pat) return true;
+    } else {
+      // wildcard support: only leading subdomain wildcard, e.g. https://*.example.com
+      // break into protocol and host pattern
+      const [proto, host] = pat.split('://');
+      try {
+        const { protocol, host: reqHost } = new URL(origin);
+        if (proto && `${proto}:` !== protocol) continue;
+        // pattern "*.example.com" should match "a.example.com", "b.c.example.com" but not "example.com"
+        if (host.startsWith('*.')) {
+          const apex = host.slice(2); // example.com
+          if (reqHost === apex) continue; // no naked apex for wildcard
+          if (reqHost.endsWith('.' + apex)) return true;
+        } else {
+          // '*' somewhere else: treat '*' as multi-char wildcard
+          const regex = new RegExp('^' + host.split('*').map(x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
+          if (regex.test(reqHost)) return true;
+        }
+      } catch {
+        continue;
+      }
+    }
+  }
+  return false;
+}
+
+const corsOptionsDelegate = function (req, callback) {
+  const origin = req.headers.origin;
+  const allowed = isAllowedOrigin(origin);
+
+  // Always respond; if not allowed, omit CORS headers (browser will block)
+  const options = {
+    origin: allowed ? origin : false,
     credentials: true,
-  })
-);
+    methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+    allowedHeaders: [
+      'Origin',
+      'X-Requested-With',
+      'Content-Type',
+      'Accept',
+      'Authorization'
+    ],
+    exposedHeaders: ['Content-Length', 'Content-Type'],
+    maxAge: 86400 // cache preflight 24h
+  };
+
+  if (!allowed && origin) {
+    console.warn('[CORS] Blocked request from:', origin);
+  }
+  callback(null, options);
+};
+
+app.use(cors(corsOptionsDelegate));
+// Explicitly handle preflight for all routes
+app.options('*', cors(corsOptionsDelegate));
+
+
+
 
 app.use(express.json());
 app.use(cookieParser());
 
-// Serve static tiles
-app.use('/Shajra Parcha', express.static(TILE_ROOT));
+app.use((req, _res, next) => {
+  // Quick visibility
+  console.log('[CORS-DEBUG]', req.method, req.originalUrl, {
+    origin: req.headers.origin,
+    referer: req.headers.referer,
+    host: req.headers.host
+  });
+  next();
+});
 
-// Serve generated murabba GeoJSON files
-// This allows requests like
-//   /JSON%20Murabba/<tehsil>/<mauza>/<murabbaNo>.geojson
-// to read from the "public/JSON Murabba" folder.
-app.use('/JSON Murabba', express.static(GEO_ROOT));
-// MongoDB Connection
+// -------------------- STATIC FILES --------------------
+app.use('/Shajra Parcha', express.static(TILE_ROOT));
+app.use('/JSON Murabba',  express.static(GEO_ROOT));
+
+// -------------------- DB --------------------
 mongoose
   .connect(MONGO_URI)
   .then(() => console.log('Connected to MongoDB'))
   .catch((error) => console.error('MongoDB connection error:', error));
 
-// Sub‐schema for session tracking
+// -------------------- SCHEMAS --------------------
 const sessionSchema = new mongoose.Schema({
   start: Date,
   end: Date,
-  duration: Number,        // in seconds
+  duration: Number,
   ipAddress: String
 }, { _id: false });
 
-// Sub‐schema for renewal history
 const renewalEntrySchema = new mongoose.Schema({
   date: { type: Date,   required: true },
   type: { type: String, required: true }
 }, { _id: false });
 
-// User Schema
 const userSchema = new mongoose.Schema({
   userName: String,
   userId: { type: String, unique: true, required: true },
@@ -90,24 +187,21 @@ const userSchema = new mongoose.Schema({
   email: { type: String, unique: true, sparse: true },
   resetPasswordToken: { type: String },
   resetPasswordExpires: { type: Date },
- fee: { type: Number, default: 1000 },
+  fee: { type: Number, default: 1000 },
   renewalHistory: { type: [renewalEntrySchema], default: [] },
   renewalCount: { type: Number, default: 0 },
   sessions: [sessionSchema],
   lastActive: Date
 });
 
-// --- GeoJSON Schema & Model ---
 const geoJsonSchema = new mongoose.Schema({
   tehsil: { type: String, required: true, index: true },
   mauza:  { type: String, required: true, index: true },
   data:   { type: mongoose.Schema.Types.Mixed, required: true },
   defaultBounds: { type: [[Number]], default: null } // [[swLat, swLng], [neLat, neLng]]
 });
-
 const GeoJson = mongoose.model('GeoJson', geoJsonSchema);
 
-// --- UserLayer Schema & Model ---
 const userLayerSchema = new mongoose.Schema({
   userId:   { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
   name:     { type: String, required: true },
@@ -116,7 +210,6 @@ const userLayerSchema = new mongoose.Schema({
 });
 const UserLayer = mongoose.model('UserLayer', userLayerSchema);
 
-// --- LandRecord Schema & Model ---
 const landRecordSchema = new mongoose.Schema({
   district: String,
   tehsil: String,
@@ -126,83 +219,48 @@ const landRecordSchema = new mongoose.Schema({
   khasraIds: [Number],
   owners: [mongoose.Schema.Types.Mixed]
 });
-
 const LandRecord = mongoose.model('LandRecord', landRecordSchema);
 
+// -------------------- HELPERS --------------------
+const FEET_TO_METERS = 0.3048;
 
-// Helper: Calculate End Date, Days Remaining, and Status
 const calculateDatesAndStatus = (startDate, subscriptionType) => {
-  const subscriptionDays = {
-    Trial: 5,
-    Monthly: 30,
-    Quarterly: 90,
-    Biannual: 180,
-    Annual: 365
-  };
+  const subscriptionDays = { Trial: 5, Monthly: 30, Quarterly: 90, Biannual: 180, Annual: 365 };
   const days = subscriptionDays[subscriptionType] || 0;
+  const OFFSET_MS = 5 * 60 * 60 * 1000; // GMT+5
 
-  // All date math should respect GMT+5 (Asia/Karachi)
-  const OFFSET_MS = 5 * 60 * 60 * 1000; // +5 hours in milliseconds
-
-  // Normalize the start date to midnight in GMT+5
   const start = new Date(new Date(startDate).getTime() + OFFSET_MS);
   start.setUTCHours(0, 0, 0, 0);
 
-  // Calculate end date in GMT+5 then convert back to UTC
   const endLocal = new Date(start);
   endLocal.setUTCDate(endLocal.getUTCDate() + days);
   const endDate = new Date(endLocal.getTime() - OFFSET_MS);
 
-  // Today's date in GMT+5
   const today = new Date(Date.now() + OFFSET_MS);
   today.setUTCHours(0, 0, 0, 0);
 
-  const daysRemaining = Math.max(
-    Math.ceil((endLocal - today) / (1000 * 60 * 60 * 24)),
-    0
-  );
+  const daysRemaining = Math.max(Math.ceil((endLocal - today) / (1000 * 60 * 60 * 24)), 0);
   const status = daysRemaining > 0 ? 'Active' : 'Inactive';
 
   return { endDate, daysRemaining, status };
 };
 
-const FEET_TO_METERS = 0.3048;
-
-/**
- * shiftCoordinates(coords, dx, dy)
- *
- * Uses pure‐JS Web-Mercator formulas (no Leaflet) to convert [lon, lat] ↔ [X, Y] in meters,
- * add (dx, dy), then convert back to [lon, lat]. Recurses into nested arrays for Polygon/MultiPolygon.
- */
 function shiftCoordinates(coords, dx, dy) {
-  if (
-    Array.isArray(coords) &&
-    typeof coords[0] === 'number' &&
-    typeof coords[1] === 'number'
-  ) {
+  if (Array.isArray(coords) && typeof coords[0] === 'number' && typeof coords[1] === 'number') {
     const lon = coords[0];
     const lat = coords[1];
-
-    // Web-Mercator constants
     const R = 6378137;
-    // Project to meters
     const x0 = (lon * Math.PI * R) / 180;
     const y0 = Math.log(Math.tan((90 + lat) * Math.PI / 360)) * R;
-
-    // Apply shift in meters
     const x1 = x0 + dx;
     const y1 = y0 + dy;
-
-    // Unproject
     const lon1 = (x1 / R) * (180 / Math.PI);
     const lat1 = (360 / Math.PI) * Math.atan(Math.exp(y1 / R)) - 90;
-
     return [lon1, lat1];
   }
   return coords.map(c => shiftCoordinates(c, dx, dy));
 }
 
-// Utility: Compute bounding box of a FeatureCollection
 function getGeoJsonBounds(features) {
   const coords = [];
   features.forEach((f) => {
@@ -214,13 +272,9 @@ function getGeoJsonBounds(features) {
   if (!coords.length) return null;
   const lats = coords.map(c => c[1]);
   const lngs = coords.map(c => c[0]);
-  return [
-    [Math.min(...lats), Math.min(...lngs)],
-    [Math.max(...lats), Math.max(...lngs)]
-  ];
+  return [[Math.min(...lats), Math.min(...lngs)], [Math.max(...lats), Math.max(...lngs)]];
 }
 
-// Compute dx, dy (in meters) needed to move current bounds → target bounds (align SW corners)
 function computeShift(current, target) {
   const [curLat, curLng] = current[0];
   const [tgtLat, tgtLng] = target[0];
@@ -231,7 +285,7 @@ function computeShift(current, target) {
   return { dx: metersX, dy: metersY };
 }
 
-// Middleware: Hash Password and Calculate Status before Save
+// -------------------- MIDDLEWARE HOOKS --------------------
 userSchema.pre('save', async function (next) {
   try {
     if (this.isModified('password')) {
@@ -250,33 +304,24 @@ userSchema.pre('save', async function (next) {
     next(error);
   }
 });
-
 const User = mongoose.model('User', userSchema);
 
-// --------------------------------------------------------------------------------
-// Authentication / Authorization Middleware
-// --------------------------------------------------------------------------------
-
+// -------------------- AUTH MIDDLEWARE --------------------
 const isAuthenticated = async (req, res, next) => {
   const token = req.cookies.authToken;
   if (!token) return res.status(401).json({ message: 'Not authenticated' });
 
   jwt.verify(token, SECRET_KEY, async (err, decoded) => {
     if (err) return res.status(401).json({ message: 'Invalid or expired token' });
-
     try {
       const user = await User.findOne({ userId: decoded.userId });
       if (!user) return res.status(404).json({ message: 'User not found' });
 
-      const { status } = calculateDatesAndStatus(
-        user.startDate,
-        user.subscriptionType
-      );
+      const { status } = calculateDatesAndStatus(user.startDate, user.subscriptionType);
       if (status === 'Inactive') {
         res.clearCookie('authToken');
         return res.status(403).json({ message: 'Subscription Expired' });
       }
-
       req.user = user;
       next();
     } catch (error) {
@@ -300,18 +345,14 @@ const isSelfOrAdmin = (req, res, next) => {
   res.status(403).json({ message: 'Forbidden' });
 };
 
-// --------------------------------------------------------------------------------
-// Public & User Routes
-// --------------------------------------------------------------------------------
-
-// GET dynamic GeoJSON from MongoDB
+// -------------------- ROUTES --------------------
+// Dynamic GeoJSON
 app.get('/api/geojson/:tehsil/:mauza', async (req, res) => {
   const { tehsil, mauza } = req.params;
   const reqTime = new Date().toISOString();
   console.log(`[${reqTime}] GeoJSON fetch requested: tehsil="${tehsil}", mauza="${mauza}"`);
   res.set('Cache-Control', 'no-store');
   try {
-    // Attempt to read a locally stored GeoJSON file
     const filePath = path.resolve(GEO_ROOT, tehsil, `${mauza}.geojson`);
     let fileData = null;
     try {
@@ -321,80 +362,50 @@ app.get('/api/geojson/:tehsil/:mauza', async (req, res) => {
       console.log(`[${reqTime}] No local file for: "${tehsil}/${mauza}"`);
     }
 
-    // Check the database; it takes precedence if present
     const doc = await GeoJson.findOne({ tehsil, mauza });
-
     if (doc) {
-      const featuresCount = Array.isArray(doc.data.features)
-        ? doc.data.features.length
-        : 0;
-      console.log(
-        `[${reqTime}] GeoJSON FOUND in DB for: "${tehsil}/${mauza}". Features: ${featuresCount}`
-      );
+      const featuresCount = Array.isArray(doc.data.features) ? doc.data.features.length : 0;
+      console.log(`[${reqTime}] GeoJSON FOUND in DB for: "${tehsil}/${mauza}". Features: ${featuresCount}`);
       return res.json(doc.data);
     }
-
     if (fileData) {
       console.log(`[${reqTime}] Serving GeoJSON from disk for: "${tehsil}/${mauza}"`);
       return res.json(JSON.parse(fileData));
     }
-
     console.log(`[${reqTime}] GeoJSON NOT FOUND for: "${tehsil}/${mauza}"`);
     res.status(404).json({ message: 'GeoJSON not found' });
   } catch (err) {
-    console.error(
-      `[${new Date().toISOString()}] Error fetching GeoJSON for "${tehsil}/${mauza}":`,
-      err
-    );
+    console.error(`[${new Date().toISOString()}] Error fetching GeoJSON for "${tehsil}/${mauza}":`, err);
     res.status(500).json({ message: 'Server error' });
   }
 });
-    
-// User login
+
+// Login
 app.post('/login', async (req, res) => {
-    const { userId, password } = req.body;
-
+  const { userId, password } = req.body;
   try {
-    // 1) Lookup user
     const user = await User.findOne({ userId });
-    if (!user) {
-      return res.status(401).json({ message: 'Invalid user ID or password.' });
-    }
+    if (!user) return res.status(401).json({ message: 'Invalid user ID or password.' });
 
-    // 2) Check subscription
-    const { status, endDate, daysRemaining } = calculateDatesAndStatus(
-      user.startDate,
-      user.subscriptionType
-    );
+    const { status, endDate, daysRemaining } = calculateDatesAndStatus(user.startDate, user.subscriptionType);
     if (status === 'Inactive') {
       return res.status(403).json({
         message: 'Subscription Expired',
-        userDetails: {
-          userName:     user.userName,
-          startDate:    user.startDate,
-          endDate,
-          daysRemaining
-        }
+        userDetails: { userName: user.userName, startDate: user.startDate, endDate, daysRemaining }
       });
     }
 
-    // 3) Verify password
     const isMatch = await bcrypt.compare(password, user.password);
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Invalid user ID or password.' });
-    }
+    if (!isMatch) return res.status(401).json({ message: 'Invalid user ID or password.' });
 
-    // 4) Sign a 30-day JWT
     const token = jwt.sign({ userId: user.userId }, SECRET_KEY, { expiresIn: '30d' });
 
-    // 5) Prune old sessions & add this one
-    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
     user.sessions = user.sessions.filter(s => s.start.getTime() >= cutoff);
     user.sessions.push({ start: new Date(), ipAddress: req.ip });
     user.lastActive = new Date();
     await user.save();
 
-    // 6) Set cookie & return success
     return res
       .cookie('authToken', token, {
         httpOnly: true,
@@ -409,7 +420,7 @@ app.post('/login', async (req, res) => {
   }
 });
 
-// Admin: login as another user
+// Admin impersonation
 app.post('/admin/login-as/:userId', isAuthenticated, isAdmin, async (req, res) => {
   try {
     const target = await User.findOne({ userId: req.params.userId });
@@ -418,7 +429,7 @@ app.post('/admin/login-as/:userId', isAuthenticated, isAdmin, async (req, res) =
     const adminToken = req.cookies.authToken;
     const token = jwt.sign({ userId: target.userId }, SECRET_KEY, { expiresIn: '30d' });
 
-    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000; // 30 days
+    const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
     target.sessions = target.sessions.filter(s => s.start.getTime() >= cutoff);
     target.sessions.push({ start: new Date(), ipAddress: req.ip });
     target.lastActive = new Date();
@@ -444,12 +455,11 @@ app.post('/admin/login-as/:userId', isAuthenticated, isAdmin, async (req, res) =
   }
 });
 
-// Public: Check if a userId exists (for Forgot Password flow)
+// Public: check userId exists
 app.get('/api/public/check-userid/:userId', async (req, res) => {
   try {
     const userId = req.params.userId;
     if (!userId) return res.json({ exists: false });
-
     const exists = await User.exists({ userId });
     res.json({ exists: !!exists });
   } catch (error) {
@@ -457,37 +467,25 @@ app.get('/api/public/check-userid/:userId', async (req, res) => {
     res.status(500).json({ message: 'Server error' });
   }
 });
-// Forgot password (sends link)
+
+// Forgot password (JWT link via email) — uses global transporter
 app.post('/forgot-password', async (req, res) => {
   const { userId } = req.body;
   if (!userId) return res.status(400).json({ message: 'User ID is required' });
 
   try {
     const user = await User.findOne({ userId });
-    if (!user || !user.email) {
-      // Always respond success to avoid user enumeration
+    if (!user || !user.email || !transporter) {
+      // Don’t leak existence or transporter state
       return res.json({ message: 'If this user exists, a reset link has been sent.' });
     }
 
-    // Generate a reset token (valid 1 hour)
     const resetToken = jwt.sign({ userId: user.userId }, SECRET_KEY, { expiresIn: '1h' });
-
-    // Construct front-end link
-    const resetLink = `${process.env.CORS_ORIGIN}/reset-password?token=${resetToken}`;
-
-    // Email setup
-    let transporter = nodemailer.createTransport({
-      host: 'smtp.stackmail.com',
-      port: 465,
-      secure: true,
-      auth: {
-        user: process.env.SMTP_USER,
-        pass: process.env.SMTP_PASS,
-      },
-    });
+    const feBase = normalizeOrigin(FRONTEND_URL || CORS_RAW.split(',')[0] || '').trim();
+    const resetLink = `${feBase}/reset-password?token=${resetToken}`;
 
     await transporter.sendMail({
-      from: `"Naqsha Zameen" <${process.env.SMTP_USER}>`,
+      from: `"Naqsha Zameen" <${SMTP_USER}>`,
       to: user.email,
       subject: 'Reset your password',
       html: `
@@ -498,40 +496,43 @@ app.post('/forgot-password', async (req, res) => {
       `
     });
 
-res.json({ message: 'If this user exists, a reset link has been sent.' });
+    res.json({ message: 'If this user exists, a reset link has been sent.' });
   } catch (error) {
     console.error('Forgot password error:', error);
     res.status(500).json({ message: 'Failed to send reset email.' });
   }
 });
 
-// Password reset request (via token stored in DB)
+// Password reset request (DB token flow) — fixed to use global transporter/envs
 app.post('/api/auth/request-reset', async (req, res) => {
   const { email } = req.body;
   if (!email) return res.status(400).json({ message: 'Email required.' });
 
-  const user = await User.findOne({ email });
-  if (!user) return res.status(400).json({ message: 'No user with this email.' });
-
-  // Generate token & expiry
-  const token = crypto.randomBytes(32).toString('hex');
-  user.resetPasswordToken = token;
-  user.resetPasswordExpires = Date.now() + 1000 * 60 * 60; // 1 hour
-  await user.save();
-
-  // Construct front-end link
-  const resetLink = `${process.env.FRONTEND_URL}/reset-password/${token}`;
-
-  const mailOptions = {
-    from: process.env.EMAIL_USER,
-    to: user.email,
-    subject: 'Reset your password',
-    html: `<p>Click the link below to reset (valid 1h):<br>
-           <a href="${resetLink}">${resetLink}</a></p>`
-  };
-
   try {
-    await transporter.sendMail(mailOptions);
+    const user = await User.findOne({ email });
+    if (!user) return res.status(400).json({ message: 'No user with this email.' });
+
+    const token = crypto.randomBytes(32).toString('hex');
+    user.resetPasswordToken = token;
+    user.resetPasswordExpires = Date.now() + 1000 * 60 * 60;
+    await user.save();
+
+    const feBase = normalizeOrigin(FRONTEND_URL || CORS_RAW.split(',')[0] || '').trim();
+    const resetLink = `${feBase}/reset-password/${token}`;
+
+    if (!transporter) {
+      console.error('Email transporter not configured.');
+      return res.status(500).json({ message: 'Email is not configured on server.' });
+    }
+
+    await transporter.sendMail({
+      from: `"Naqsha Zameen" <${SMTP_USER}>`,
+      to: user.email,
+      subject: 'Reset your password',
+      html: `<p>Click the link below to reset (valid 1h):<br>
+             <a href="${resetLink}">${resetLink}</a></p>`
+    });
+
     res.json({ message: 'Password reset link sent. Check your email.' });
   } catch (err) {
     console.error('Reset email error:', err);
@@ -539,7 +540,7 @@ app.post('/api/auth/request-reset', async (req, res) => {
   }
 });
 
-// Perform password reset
+// Perform password reset (JWT flow)
 app.post('/api/auth/reset-password', async (req, res) => {
   const { token, password } = req.body;
   if (!token || !password) return res.status(400).json({ message: 'Invalid request.' });
@@ -549,7 +550,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
     const user = await User.findOne({ userId: decoded.userId });
     if (!user) return res.status(400).json({ message: 'Invalid token/user.' });
 
-    user.password = password; // Will be hashed in pre-save
+    user.password = password;
     await user.save();
     res.json({ message: 'Password reset successful. You may now log in.' });
   } catch (err) {
@@ -559,7 +560,7 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 // Logout
-app.post('/logout', isAuthenticated, async (req, res) => {  
+app.post('/logout', isAuthenticated, async (req, res) => {
   try {
     const user = await User.findOne({ userId: req.user.userId });
     if (user) {
@@ -594,14 +595,14 @@ app.post('/logout', isAuthenticated, async (req, res) => {
   }
 });
 
-// Register (open endpoint)
+// Register (open)
 app.post('/register', async (req, res) => {
   try {
     const { password, ...userData } = req.body;
     const newUser = new User({
       ...userData,
       password,
-      mauzaList: req.body.mauzaList.map((m) => m.trim()),
+      mauzaList: (req.body.mauzaList || []).map((m) => m.trim()),
     });
     await newUser.save();
     res.status(201).json({ message: 'User registered successfully!' });
@@ -611,12 +612,12 @@ app.post('/register', async (req, res) => {
   }
 });
 
-// Renewal
+// Renew
 app.post('/users/:userId/renew', isAuthenticated, async (req, res) => {
   try {
     const { subscriptionType } = req.body;
     const now = new Date();
-        const user = await User.findOne({ userId: req.params.userId });
+    const user = await User.findOne({ userId: req.params.userId });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
     user.renewalHistory.push({ date: now, type: subscriptionType });
@@ -636,7 +637,7 @@ app.post('/users/:userId/renew', isAuthenticated, async (req, res) => {
   }
 });
 
-// Change Password (authenticated)
+// Change password
 app.post('/change-password', isAuthenticated, async (req, res) => {
   const { oldPassword, newPassword } = req.body;
   try {
@@ -669,13 +670,10 @@ app.get('/profile', isAuthenticated, async (req, res) => {
   }
 });
 
-// Heartbeat – update user's last active timestamp
+// Heartbeat
 app.post('/heartbeat', isAuthenticated, async (req, res) => {
   try {
-    await User.updateOne(
-      { userId: req.user.userId },
-      { lastActive: new Date() }
-    );
+    await User.updateOne({ userId: req.user.userId }, { lastActive: new Date() });
     res.json({ success: true });
   } catch (err) {
     console.error('Heartbeat error', err);
@@ -683,10 +681,7 @@ app.post('/heartbeat', isAuthenticated, async (req, res) => {
   }
 });
 
-// --------------------------------------------------------------------------------
-// Admin / Protected CRUD Routes
-// --------------------------------------------------------------------------------
-
+// Admin/Protected: search
 app.get('/api/users/search', isAuthenticated, isAdmin, async (req, res) => {
   const query = req.query.query?.toLowerCase() || '';
   if (!query) return res.json([]);
@@ -704,6 +699,7 @@ app.get('/api/users/search', isAuthenticated, isAdmin, async (req, res) => {
   }
 });
 
+// Tehsil list (combined)
 app.get('/api/tehsil-list', async (req, res) => {
   const fsP = require('fs/promises');
   try {
@@ -712,17 +708,9 @@ app.get('/api/tehsil-list', async (req, res) => {
       fsP.readdir(GEO_ROOT,  { withFileTypes: true }).catch(() => []),
       fsP.readdir(TILE_ROOT, { withFileTypes: true }).catch(() => [])
     ]);
-
-    const geoNames  = geoDirs
-      .filter(d => d.isDirectory())
-      .map(d => d.name);
-
-    const tileNames = tileDirs
-      .filter(d => d.isDirectory())
-      .map(d => d.name);
-
+    const geoNames  = geoDirs.filter(d => d.isDirectory()).map(d => d.name);
+    const tileNames = tileDirs.filter(d => d.isDirectory()).map(d => d.name);
     const names = new Set([...dbTehsils, ...geoNames, ...tileNames]);
-
     res.json([...names].sort((a, b) => a.localeCompare(b)));
   } catch (err) {
     console.error('tehsil-list error:', err);
@@ -730,8 +718,8 @@ app.get('/api/tehsil-list', async (req, res) => {
   }
 });
 
-// GET all users (admin only)
-app.get('/users', isAuthenticated, isAdmin, async (req, res) => {
+// Users (admin only)
+app.get('/users', isAuthenticated, isAdmin, async (_req, res) => {
   try {
     const users = await User.find();
     res.status(200).json(users);
@@ -741,7 +729,7 @@ app.get('/users', isAuthenticated, isAdmin, async (req, res) => {
   }
 });
 
-// GET user by ID (self or admin)
+// User by ID (self or admin)
 app.get('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
   try {
     const user = await User.findOne({ userId: req.params.userId });
@@ -753,7 +741,7 @@ app.get('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
   }
 });
 
-// UPDATE user (self or admin)
+// Update user (self or admin)
 app.put('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
   try {
     const updateData = { ...req.body };
@@ -764,20 +752,14 @@ app.put('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
     const user = await User.findOne({ userId: req.params.userId });
     if (!user) return res.status(404).json({ message: 'User not found' });
 
-    if (
-      req.user.userType !== 'admin' &&
-      'email' in updateData &&
-      user.email &&
-      updateData.email !== user.email
-    ) {
+    if (req.user.userType !== 'admin' && 'email' in updateData && user.email && updateData.email !== user.email) {
       return res.status(403).json({ message: 'Email can only be changed by an admin' });
     }
 
     let isRenewal = false;
     if (
       (updateData.subscriptionType && updateData.subscriptionType !== user.subscriptionType) ||
-      (updateData.startDate &&
-        new Date(updateData.startDate).getTime() !== new Date(user.startDate).getTime())
+      (updateData.startDate && new Date(updateData.startDate).getTime() !== new Date(user.startDate).getTime())
     ) {
       isRenewal = true;
     }
@@ -785,10 +767,7 @@ app.put('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
     Object.assign(user, updateData);
 
     if (isRenewal) {
-      user.renewalHistory.push({
-        date: new Date(),
-        type: user.subscriptionType
-      });
+      user.renewalHistory.push({ date: new Date(), type: user.subscriptionType });
       user.renewalCount = (user.renewalCount || 0) + 1;
     }
 
@@ -800,7 +779,7 @@ app.put('/users/:userId', isAuthenticated, isSelfOrAdmin, async (req, res) => {
   }
 });
 
-// DELETE user (admin only)
+// Delete user (admin)
 app.delete('/users/:userId', isAuthenticated, isAdmin, async (req, res) => {
   try {
     const user = await User.findOneAndDelete({ userId: req.params.userId });
@@ -812,8 +791,8 @@ app.delete('/users/:userId', isAuthenticated, isAdmin, async (req, res) => {
   }
 });
 
-// Stats (public)
-app.get('/stats', async (req, res) => {
+// Public stats
+app.get('/stats', async (_req, res) => {
   try {
     const totalUsers = await User.countDocuments();
     const activeCutoff = new Date(Date.now() - 2 * 60 * 1000);
@@ -831,13 +810,10 @@ app.get('/stats', async (req, res) => {
   }
 });
 
-/* ------------------------------------------------------------------
-   FULL mauza list = geojson names ∪ folder names
------------------------------------------------------------------- */
+// Mauza list
 app.get('/api/mauza-list/:tehsil', async (req, res) => {
   const fsP = require('fs/promises');
   const tehsil = req.params.tehsil.trim();
-
   const geoDir  = path.resolve(GEO_ROOT,  tehsil);
   const tileDir = path.resolve(TILE_ROOT, tehsil);
 
@@ -847,31 +823,19 @@ app.get('/api/mauza-list/:tehsil', async (req, res) => {
       fsP.readdir(tileDir, { withFileTypes: true }).catch(() => [])
     ]);
 
-    const geoNames  = geoFiles
-      .filter(f => f.toLowerCase().endsWith('.geojson'))
-      .map(f => path.parse(f).name);
-
-    const tileNames = tileDirents
-      .filter(d => d.isDirectory())
-      .map(d => d.name);
-
+    const geoNames  = geoFiles.filter(f => f.toLowerCase().endsWith('.geojson')).map(f => path.parse(f).name);
+    const tileNames = tileDirents.filter(d => d.isDirectory()).map(d => d.name);
     const names = new Set([...geoNames, ...tileNames]);
 
-    console.log('[mauza-list]', tehsil,
-                'geo:', geoNames.length,
-                'tiles:', tileNames.length,
-                'total:', names.size);
-
+    console.log('[mauza-list]', tehsil, 'geo:', geoNames.length, 'tiles:', tileNames.length, 'total:', names.size);
     res.json([...names].sort((a, b) => a.localeCompare(b)));
   } catch (err) {
     console.error('mauza-list error:', err);
-    res.json([]);   // fail soft
+    res.json([]); // fail soft
   }
 });
 
-/* ------------------------------------------------------------------
-   LIVE list of users whose last session has no `end` timestamp
------------------------------------------------------------------- */
+// Online users
 app.get('/online-users', isAuthenticated, async (_req, res) => {
   try {
     const cutoff = new Date(Date.now() - 2 * 60 * 1000);
@@ -897,7 +861,7 @@ app.get('/online-users', isAuthenticated, async (_req, res) => {
   }
 });
 
-// POST: Shift GeoJSON
+// Shift GeoJSON
 app.post('/api/geojson/:tehsil/:mauza/shift', isAuthenticated, async (req, res) => {
   const { tehsil, mauza } = req.params;
   const { distance, direction } = req.body;
@@ -912,32 +876,26 @@ app.post('/api/geojson/:tehsil/:mauza/shift', isAuthenticated, async (req, res) 
   const doc = await GeoJson.findOne({ tehsil, mauza });
   if (!doc) return res.status(404).json({ message: 'GeoJSON not found' });
 
-  // Save defaultBounds if missing
   if (!doc.defaultBounds) {
     const bounds = getGeoJsonBounds(doc.data.features);
     if (!bounds) return res.status(400).json({ message: 'No geometry found' });
     doc.defaultBounds = bounds;
   }
 
-  // Shift each feature’s coordinates in place
   doc.data.features.forEach((f) => {
     f.geometry.coordinates = shiftCoordinates(f.geometry.coordinates, dx, dy);
   });
 
-  // ← Mark the Mixed field as modified before saving
   doc.markModified('data');
-
   await doc.save();
 
-  console.log(
-    `[${new Date().toISOString()}] Shifted GeoJSON stored back to DB for ${tehsil}/${mauza}`
-  );
+  console.log(`[${new Date().toISOString()}] Shifted GeoJSON stored back to DB for ${tehsil}/${mauza}`);
   res.json({ success: true, data: doc.data });
 });
 
-// POST: Reset GeoJSON to Default Bounds
+// Reset GeoJSON to default
 app.post('/api/geojson/:tehsil/:mauza/reset', isAuthenticated, async (req, res) => {
-    const { tehsil, mauza } = req.params;
+  const { tehsil, mauza } = req.params;
   const doc = await GeoJson.findOne({ tehsil, mauza });
   if (!doc || !doc.defaultBounds) return res.status(400).json({ message: 'No default bounds set' });
 
@@ -945,23 +903,16 @@ app.post('/api/geojson/:tehsil/:mauza/reset', isAuthenticated, async (req, res) 
   if (!currentBounds) return res.status(400).json({ message: 'No geometry found' });
 
   const { dx, dy } = computeShift(currentBounds, doc.defaultBounds);
-
-  // Shift back
   doc.data.features.forEach(f => {
     f.geometry.coordinates = shiftCoordinates(f.geometry.coordinates, dx, dy);
   });
 
-  // ← Mark the Mixed field as modified before saving
   doc.markModified('data');
-
-await doc.save();
+  await doc.save();
   res.json({ success: true, data: doc.data });
 });
 
-/* ------------------------------------------------------------------
-   User Layer Routes
------------------------------------------------------------------- */
-// Create new layer (max 10 per user)
+// User Layers CRUD
 app.post('/api/user-layers', isAuthenticated, async (req, res) => {
   const { name, geojson } = req.body;
   if (!name || !geojson) return res.status(400).json({ message: 'Name and geojson required' });
@@ -969,23 +920,16 @@ app.post('/api/user-layers', isAuthenticated, async (req, res) => {
   const count = await UserLayer.countDocuments({ userId: req.user._id });
   if (count >= 10) return res.status(400).json({ message: 'Layer limit reached' });
 
-  const layer = new UserLayer({
-    userId: req.user._id,
-    name,
-    geojson
-  });
-
+  const layer = new UserLayer({ userId: req.user._id, name, geojson });
   await layer.save();
   res.status(201).json(layer);
 });
 
-// List layers for logged-in user
 app.get('/api/user-layers', isAuthenticated, async (req, res) => {
   const layers = await UserLayer.find({ userId: req.user._id }).sort('-updatedAt');
   res.json(layers);
 });
 
-// Update a layer
 app.put('/api/user-layers/:id', isAuthenticated, async (req, res) => {
   const { name, geojson } = req.body;
   const layer = await UserLayer.findOne({ _id: req.params.id, userId: req.user._id });
@@ -997,17 +941,13 @@ app.put('/api/user-layers/:id', isAuthenticated, async (req, res) => {
   res.json(layer);
 });
 
-// Delete a layer
 app.delete('/api/user-layers/:id', isAuthenticated, async (req, res) => {
   const layer = await UserLayer.findOneAndDelete({ _id: req.params.id, userId: req.user._id });
   if (!layer) return res.status(404).json({ message: 'Layer not found' });
   res.json({ success: true });
 });
-/* ------------------------------------------------------------------
-   Land Record Routes
------------------------------------------------------------------- */
 
-// List available tehsils
+// Land Record APIs
 app.get('/api/landrecords/tehsils', isAuthenticated, async (_req, res) => {
   try {
     const tehsils = await LandRecord.distinct('tehsil');
@@ -1018,7 +958,6 @@ app.get('/api/landrecords/tehsils', isAuthenticated, async (_req, res) => {
   }
 });
 
-// List mauzas for a tehsil
 app.get('/api/landrecords/mauzas/:tehsil', isAuthenticated, async (req, res) => {
   try {
     const mauzas = await LandRecord.distinct('mouza', { tehsil: req.params.tehsil });
@@ -1029,7 +968,6 @@ app.get('/api/landrecords/mauzas/:tehsil', isAuthenticated, async (req, res) => 
   }
 });
 
-// List khewats for a mauza
 app.get('/api/landrecords/khewats/:tehsil/:mauza', isAuthenticated, async (req, res) => {
   const { tehsil, mauza } = req.params;
   try {
@@ -1041,7 +979,6 @@ app.get('/api/landrecords/khewats/:tehsil/:mauza', isAuthenticated, async (req, 
   }
 });
 
-// Full details for a khewat
 app.get('/api/landrecords/details/:khewatId', isAuthenticated, async (req, res) => {
   const khewatId = parseInt(req.params.khewatId, 10);
   try {
@@ -1054,5 +991,5 @@ app.get('/api/landrecords/details/:khewatId', isAuthenticated, async (req, res) 
   }
 });
 
-// Start Server
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+// -------------------- START --------------------
+app.listen(PORT, () => console.log(`Server running on ${process.env.CORS_ORIGIN}:${PORT}`));
