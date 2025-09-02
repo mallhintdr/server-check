@@ -21,33 +21,17 @@ const nodemailer = require('nodemailer');
 const app = express();
 
 // -------------------- HELPERS --------------------
-// Normalize origins for consistent comparison
-const normalizeOrigin = (o) => {
-  if (!o) return '';
-  try {
-    if (o.includes('*')) return o.toLowerCase().replace(/\/+$/, '');
-    const u = new URL(o);
-    return `${u.protocol}//${u.host}`.toLowerCase().replace(/\/+$/, '');
-  } catch {
-    return o.toLowerCase().replace(/\/+$/, '');
-  }
-};
 
 // -------------------- ENV --------------------
 const PORT            = process.env.PORT || 5000;
 const SECRET_KEY      = process.env.SECRET_KEY;
 const MONGO_URI       = process.env.MONGO_URI;
 
-// Ensure dashboard.naqsha-zameen.pk is always allowed for CORS
-const DEFAULT_ALLOWED_ORIGINS = ['https://dashboard.naqsha-zameen.pk'];
-const ALLOWED_ORIGINS = Array.from(new Set(
-  [...DEFAULT_ALLOWED_ORIGINS, ...(process.env.CORS_ORIGIN || '').split(',')]
-    .map(normalizeOrigin)
-    .filter(Boolean)
-));
+// CORS Origin Configuration - simplified and reliable
+const CORS_ORIGIN = process.env.CORS_ORIGIN || 'https://dashboard.naqsha-zameen.pk';
 const SMTP_USER       = process.env.SMTP_USER || '';  // e.g. reset-password@naqsha-zameen.pk
 const SMTP_PASS       = process.env.SMTP_PASS || '';
-const FRONTEND_URL    = process.env.FRONTEND_URL || ALLOWED_ORIGINS[0];
+const FRONTEND_URL    = process.env.FRONTEND_URL || CORS_ORIGIN;
 
 // -------------------- STATIC PATHS --------------------
 const ROOT        = path.join(__dirname, '..');        // geo-dashboard/
@@ -65,44 +49,12 @@ const transporter = (SMTP_USER && SMTP_PASS)
     })
   : null;
 
-// -------------------- CORS (ALLOW-LIST WITH NORMALIZATION & WILDCARD) --------------------
-const isOriginAllowed = (origin) => {
-  const normalized = normalizeOrigin(origin);
-  return ALLOWED_ORIGINS.some((allowed) => {
-    if (allowed.includes('*')) {
-      const pattern = new RegExp('^' + allowed.replace(/\*/g, '.*') + '$');
-      return pattern.test(normalized);
-    }
-    return allowed === normalized;
-  });
-};
-
-const corsOptions = {
-  origin: (origin, callback) => {
-    if (!origin || isOriginAllowed(origin)) {
-      return callback(null, true);
-    }
-    return callback(new Error('Not allowed by CORS'));
-  },
-  credentials: true,
-   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
-  optionsSuccessStatus: 200 // Some legacy browsers choke on 204
-};
-
-app.use(cors(corsOptions));
-
-// Global preflight handler for all routes
-app.options('*', cors(corsOptions));
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && isOriginAllowed(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Access-Control-Allow-Credentials', 'true');
-  }
-  next();
-});
+// -------------------- CORS CONFIGURATION (SIMPLIFIED & RELIABLE) --------------------
+// Use the same simple approach as the working server-old.js
+app.use(cors({ 
+  origin: CORS_ORIGIN, 
+  credentials: true 
+}));
 
 app.use(express.json());
 app.use(cookieParser());
@@ -379,7 +331,7 @@ app.post('/login', async (req, res) => {
       .cookie('authToken', token, {
         httpOnly: true,
         secure:   process.env.NODE_ENV === 'production',
-        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // 'none' required for cross-origin cookies
+        sameSite: 'strict',
         maxAge:   30 * 24 * 60 * 60 * 1000
       })
       .json({ message: 'Login successful' });
@@ -450,7 +402,7 @@ app.post('/forgot-password', async (req, res) => {
     }
 
     const resetToken = jwt.sign({ userId: user.userId }, SECRET_KEY, { expiresIn: '1h' });
-    const feBase = normalizeOrigin(FRONTEND_URL).trim();
+    const feBase = FRONTEND_URL.replace(/\/+$/, '');
     const resetLink = `${feBase}/reset-password?token=${resetToken}`;
 
     await transporter.sendMail({
@@ -486,7 +438,7 @@ app.post('/api/auth/request-reset', async (req, res) => {
     user.resetPasswordExpires = Date.now() + 1000 * 60 * 60;
     await user.save();
 
-    const feBase = normalizeOrigin(FRONTEND_URL).trim();
+    const feBase = FRONTEND_URL.replace(/\/+$/, '');
     const resetLink = `${feBase}/reset-password/${token}`;
 
     if (!transporter) {
@@ -959,17 +911,9 @@ app.get('/api/landrecords/details/:khewatId', isAuthenticated, async (req, res) 
     res.status(500).json({ error: 'Unable to fetch record' });
   }
 });
-// FINAL middleware to set CORS headers even on error responses
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (origin && isOriginAllowed(origin)) {
-    res.setHeader('Access-Control-Allow-Origin', origin);
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-  }
-  next();
-});
+
 
 // -------------------- START --------------------
 app.listen(PORT, () =>
-  console.log(`Server running on port ${PORT} (CORS: ${ALLOWED_ORIGINS.join(', ')})`)
+  console.log(`Server running on port ${PORT} (CORS: ${CORS_ORIGIN})`)
 );
