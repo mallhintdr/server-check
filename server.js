@@ -20,14 +20,34 @@ const nodemailer = require('nodemailer');
 
 const app = express();
 
+// -------------------- HELPERS --------------------
+// Normalize origins for consistent comparison
+const normalizeOrigin = (o) => {
+  if (!o) return '';
+  try {
+    if (o.includes('*')) return o.toLowerCase().replace(/\/+$/, '');
+    const u = new URL(o);
+    return `${u.protocol}//${u.host}`.toLowerCase().replace(/\/+$/, '');
+  } catch {
+    return o.toLowerCase().replace(/\/+$/, '');
+  }
+};
+
 // -------------------- ENV --------------------
-const PORT        = process.env.PORT || 5000;
-const SECRET_KEY  = process.env.SECRET_KEY;
-const MONGO_URI   = process.env.MONGO_URI;
-const CORS_RAW    = process.env.CORS_ORIGIN || '';
-const SMTP_USER   = process.env.SMTP_USER || '';  // e.g. reset-password@naqsha-zameen.pk
-const SMTP_PASS   = process.env.SMTP_PASS || '';
-const FRONTEND_URL = process.env.FRONTEND_URL || (CORS_RAW.split(',')[0] || '').trim();
+const PORT            = process.env.PORT || 5000;
+const SECRET_KEY      = process.env.SECRET_KEY;
+const MONGO_URI       = process.env.MONGO_URI;
+
+// Ensure dashboard.naqsha-zameen.pk is always allowed for CORS
+const DEFAULT_ALLOWED_ORIGINS = ['https://dashboard.naqsha-zameen.pk'];
+const ALLOWED_ORIGINS = Array.from(new Set(
+  [...DEFAULT_ALLOWED_ORIGINS, ...(process.env.CORS_ORIGIN || '').split(',')]
+    .map(normalizeOrigin)
+    .filter(Boolean)
+));
+const SMTP_USER       = process.env.SMTP_USER || '';  // e.g. reset-password@naqsha-zameen.pk
+const SMTP_PASS       = process.env.SMTP_PASS || '';
+const FRONTEND_URL    = process.env.FRONTEND_URL || ALLOWED_ORIGINS[0];
 
 // -------------------- STATIC PATHS --------------------
 const ROOT        = path.join(__dirname, '..');        // geo-dashboard/
@@ -46,94 +66,43 @@ const transporter = (SMTP_USER && SMTP_PASS)
   : null;
 
 // -------------------- CORS (ALLOW-LIST WITH NORMALIZATION & WILDCARD) --------------------
-const rawOrigins = (process.env.CORS_ORIGIN || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-// Normalize: lowercase, strip trailing slashes
-const normalizeOrigin = (o) => {
-  if (!o) return '';
-  try {
-    // If pattern like https://*.domain.tld keep as-is for matcher
-    if (o.includes('*')) return o.toLowerCase().replace(/\/+$/, '');
-    const u = new URL(o);
-    return `${u.protocol}//${u.host}`.toLowerCase().replace(/\/+$/, '');
-  } catch {
-    // Not a full URL (rare). Fallback:
-    return o.toLowerCase().replace(/\/+$/, '');
-  }
-};
-
-const allowedOrigins = rawOrigins.map(normalizeOrigin);
-
-// test function supports exact matches and wildcard subdomains (e.g., https://*.naqsha-zameen.pk)
-function isAllowedOrigin(requestOrigin) {
-  if (!requestOrigin) return true; // allow non-browser/SSR/no-origin requests
-  const origin = normalizeOrigin(requestOrigin);
-
-  for (const pat of allowedOrigins) {
-    if (!pat) continue;
-    if (!pat.includes('*')) {
-      // exact match
-      if (origin === pat) return true;
-    } else {
-      // wildcard support: only leading subdomain wildcard, e.g. https://*.example.com
-      // break into protocol and host pattern
-      const [proto, host] = pat.split('://');
-      try {
-        const { protocol, host: reqHost } = new URL(origin);
-        if (proto && `${proto}:` !== protocol) continue;
-        // pattern "*.example.com" should match "a.example.com", "b.c.example.com" but not "example.com"
-        if (host.startsWith('*.')) {
-          const apex = host.slice(2); // example.com
-          if (reqHost === apex) continue; // no naked apex for wildcard
-          if (reqHost.endsWith('.' + apex)) return true;
-        } else {
-          // '*' somewhere else: treat '*' as multi-char wildcard
-          const regex = new RegExp('^' + host.split('*').map(x => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('.*') + '$');
-          if (regex.test(reqHost)) return true;
-        }
-      } catch {
-        continue;
-      }
+const isOriginAllowed = (origin) => {
+  const normalized = normalizeOrigin(origin);
+  return ALLOWED_ORIGINS.some((allowed) => {
+    if (allowed.includes('*')) {
+      const pattern = new RegExp('^' + allowed.replace(/\*/g, '.*') + '$');
+      return pattern.test(normalized);
     }
-  }
-  return false;
-}
-
-const corsOptionsDelegate = function (req, callback) {
-  const origin = req.headers.origin;
-  const allowed = isAllowedOrigin(origin);
-
-  // Always respond; if not allowed, omit CORS headers (browser will block)
-  const options = {
-    origin: allowed ? origin : false,
-    credentials: true,
-    methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-    allowedHeaders: [
-      'Origin',
-      'X-Requested-With',
-      'Content-Type',
-      'Accept',
-      'Authorization'
-    ],
-    exposedHeaders: ['Content-Length', 'Content-Type'],
-    maxAge: 86400 // cache preflight 24h
-  };
-
-  if (!allowed && origin) {
-    console.warn('[CORS] Blocked request from:', origin);
-  }
-  callback(null, options);
+    return allowed === normalized;
+  });
 };
 
-app.use(cors(corsOptionsDelegate));
-// Explicitly handle preflight for all routes
-app.options('*', cors(corsOptionsDelegate));
+const corsOptions = {
+  origin: (origin, callback) => {
+    if (!origin || isOriginAllowed(origin)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'Cookie'],
+  optionsSuccessStatus: 200 // Some legacy browsers choke on 204
+};
 
+app.use(cors(corsOptions));
 
+// Global preflight handler for all routes
+app.options('*', cors(corsOptions));
 
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Access-Control-Allow-Credentials', 'true');
+  }
+  next();
+});
 
 app.use(express.json());
 app.use(cookieParser());
@@ -410,7 +379,7 @@ app.post('/login', async (req, res) => {
       .cookie('authToken', token, {
         httpOnly: true,
         secure:   process.env.NODE_ENV === 'production',
-        sameSite: 'strict',
+        sameSite: process.env.NODE_ENV === 'production' ? 'none' : 'lax', // 'none' required for cross-origin cookies
         maxAge:   30 * 24 * 60 * 60 * 1000
       })
       .json({ message: 'Login successful' });
@@ -481,7 +450,7 @@ app.post('/forgot-password', async (req, res) => {
     }
 
     const resetToken = jwt.sign({ userId: user.userId }, SECRET_KEY, { expiresIn: '1h' });
-    const feBase = normalizeOrigin(FRONTEND_URL || CORS_RAW.split(',')[0] || '').trim();
+    const feBase = normalizeOrigin(FRONTEND_URL).trim();
     const resetLink = `${feBase}/reset-password?token=${resetToken}`;
 
     await transporter.sendMail({
@@ -517,7 +486,7 @@ app.post('/api/auth/request-reset', async (req, res) => {
     user.resetPasswordExpires = Date.now() + 1000 * 60 * 60;
     await user.save();
 
-    const feBase = normalizeOrigin(FRONTEND_URL || CORS_RAW.split(',')[0] || '').trim();
+    const feBase = normalizeOrigin(FRONTEND_URL).trim();
     const resetLink = `${feBase}/reset-password/${token}`;
 
     if (!transporter) {
@@ -990,6 +959,17 @@ app.get('/api/landrecords/details/:khewatId', isAuthenticated, async (req, res) 
     res.status(500).json({ error: 'Unable to fetch record' });
   }
 });
+// FINAL middleware to set CORS headers even on error responses
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+  if (origin && isOriginAllowed(origin)) {
+    res.setHeader('Access-Control-Allow-Origin', origin);
+    res.setHeader('Access-Control-Allow-Credentials', 'true');
+  }
+  next();
+});
 
 // -------------------- START --------------------
-app.listen(PORT, () => console.log(`Server running on ${process.env.CORS_ORIGIN}:${PORT}`));
+app.listen(PORT, () =>
+  console.log(`Server running on port ${PORT} (CORS: ${ALLOWED_ORIGINS.join(', ')})`)
+);
